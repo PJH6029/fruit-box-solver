@@ -51,7 +51,7 @@ class Board:
         c = max(cnts, key=cv2.contourArea)
         self.region = cv2.boundingRect(c)
 
-    def set_play_buttons_from_screen(self, screen: np.ndarray):
+    def set_play_button_from_screen(self, screen: np.ndarray):
         """Locate Play & Reset and store click lambdas."""
         if self.region is None:
             self._find_game_region(screen)
@@ -71,7 +71,7 @@ class Board:
         play_pt  = _match_center(self.play_tpl)
         self.play  = lambda: pyautogui.click(play_pt)
     
-    def set_reset_buttons_from_screen(self, screen: np.ndarray):
+    def set_reset_button_from_screen(self, screen: np.ndarray):
         """Locate Play & Reset and store click lambdas."""
         if self.region is None:
             self._find_game_region(screen)
@@ -179,13 +179,13 @@ def start_game(board: Board):
     
     screen = capture_screen()
     cv2.imwrite("screen_before_reset.png", screen)
-    board.set_reset_buttons_from_screen(screen)
+    board.set_reset_button_from_screen(screen)
     board.reset()
     time.sleep(1)
     
     screen = capture_screen()
     cv2.imwrite("screen_after_reset.png", screen)
-    board.set_play_buttons_from_screen(screen)
+    board.set_play_button_from_screen(screen)
     board.play()
     time.sleep(1)
 
