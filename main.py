@@ -1,271 +1,212 @@
 import time
-import pyautogui
-import numpy as np
 import cv2
+import numpy as np
+import pyautogui
+import glob
+import os
+import pytesseract
 from pynput.mouse import Button, Controller
-
-class FruitBoxSolver:
-    def solve(self, board):
-        """
-        Solve the Fruit Box game and return a sequence of moves.
-        The board is a 2D array of Cell objects.
-        """
-        raise NotImplementedError("You must implement this method in your solver class.")
-
-class FruitBoxNaiveSolver(FruitBoxSolver):
-    pass
-
-config = {
-    'NROWS': 10,
-    'NCOLS': 17,
-    'debug': True,
-    'min_matches': 5,  # minimum # of good matches before we consider a result
-    'solver': FruitBoxNaiveSolver,  # set this to your solver class
-}
-
-class Cell:
-    value = None
-    x = None
-    y = None
-
-class Board:
-    play = None
-    reset = None
-    board = None
-    
-    def set_buttons_from_screen(self, screen):
-        self.play, self.reset = get_play_reset_buttons(screen)
-    
-    def set_board_from_screen(self, screen):
-        self.board = get_board(screen)
 
 def capture_screen():
     """Capture entire screen as a BGR image."""
     w, h = pyautogui.size()
-    screen = pyautogui.screenshot(region=(0, 0, w, h))
-    return cv2.cvtColor(np.array(screen), cv2.COLOR_RGB2BGR)
+    img = pyautogui.screenshot(region=(0, 0, w, h))
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-def sift_score_digit(roi_gray, digit_gray, ratio_threshold=0.75):
-    sift = cv2.SIFT_create()
+class Board:
+    DIGIT_MATCH_THRESH = 0.6
+
+    def __init__(
+        self,
+        play_template_path: str = "templates/play.png",
+        reset_template_path: str = "templates/reset.png",
+        digit_templates_dir: str = "templates"
+    ):
+        # play/reset
+        self.play_tpl  = cv2.imread(play_template_path)
+        self.reset_tpl = cv2.imread(reset_template_path)
+
+        # load digit templates (0–9)
+        self.digit_templates = {}
+        for tpl_path in glob.glob(os.path.join(digit_templates_dir, "[0-9].png")):
+            digit = int(os.path.basename(tpl_path)[0])
+            img   = cv2.imread(tpl_path, cv2.IMREAD_GRAYSCALE)
+            self.digit_templates[digit] = img
+
+        self.region    = None      # (x,y,w,h) of the green border window
+        self.play      = None      # callable to click Play
+        self.reset     = None      # callable to click Reset
+        self.board     = None      # final 2D list of ints
+
+    def _find_game_region(self, screen: np.ndarray):
+        """Find the green-bordered game window."""
+        hsv    = cv2.cvtColor(screen, cv2.COLOR_BGR2HSV)
+        lowerG = np.array([40, 60, 60])
+        upperG = np.array([80, 255, 255])
+        mask   = cv2.inRange(hsv, lowerG, upperG)
+        mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7,7),np.uint8))
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            raise RuntimeError("Cannot find game window!")
+        c = max(cnts, key=cv2.contourArea)
+        self.region = cv2.boundingRect(c)
+
+    def set_play_buttons_from_screen(self, screen: np.ndarray):
+        """Locate Play & Reset and store click lambdas."""
+        if self.region is None:
+            self._find_game_region(screen)
+        x0,y0,w0,h0 = self.region
+        win = screen[y0:y0+h0, x0:x0+w0]
+
+        def _match_center(tpl):
+            res = cv2.matchTemplate(win, tpl, cv2.TM_CCOEFF_NORMED)
+            _, maxval, _, maxloc = cv2.minMaxLoc(res)
+            if maxval < 0.7:
+                # raise RuntimeError("Template not found!")
+                return None
+            tx, ty = maxloc
+            th, tw = tpl.shape[:2]
+            return (x0 + tx + tw//2, y0 + ty + th//2)
+
+        play_pt  = _match_center(self.play_tpl)
+        self.play  = lambda: pyautogui.click(play_pt)
     
-    kp_roi, des_roi = sift.detectAndCompute(roi_gray, None)
-    kp_dig, des_dig = sift.detectAndCompute(digit_gray, None)
+    def set_reset_buttons_from_screen(self, screen: np.ndarray):
+        """Locate Play & Reset and store click lambdas."""
+        if self.region is None:
+            self._find_game_region(screen)
+        x0,y0,w0,h0 = self.region
+        win = screen[y0:y0+h0, x0:x0+w0]
+
+        def _match_center(tpl):
+            res = cv2.matchTemplate(win, tpl, cv2.TM_CCOEFF_NORMED)
+            _, maxval, _, maxloc = cv2.minMaxLoc(res)
+            if maxval < 0.7:
+                # raise RuntimeError("Template not found!")
+                return None
+            tx, ty = maxloc
+            th, tw = tpl.shape[:2]
+            return (x0 + tx + tw//2, y0 + ty + th//2)
+
+        reset_pt = _match_center(self.reset_tpl)
+        self.reset = lambda: pyautogui.click(reset_pt)
+
+    def set_board_from_screen(self, screen: np.ndarray):
+        """Detect red apples and number them via template matching."""
+        if self.region is None:
+            self._find_game_region(screen)
+        x0,y0,w0,h0 = self.region
+        win = screen[y0:y0+h0, x0:x0+w0]
+
+        # 1) isolate red regions
+        hsv    = cv2.cvtColor(win, cv2.COLOR_BGR2HSV)
+        lower1 = np.array([0,  70, 50]); upper1 = np.array([10, 255,255])
+        lower2 = np.array([170,70, 50]); upper2 = np.array([180,255,255])
+        m1 = cv2.inRange(hsv, lower1, upper1)
+        m2 = cv2.inRange(hsv, lower2, upper2)
+        mask = cv2.bitwise_or(m1, m2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((3,3),np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3),np.uint8))
+
+        # 2) find each apple bounding box
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        for c in cnts:
+            x,y,w,h = cv2.boundingRect(c)
+            if w < 20 or h < 20: 
+                continue
+            boxes.append((x,y,w,h))
+
+        # 3) group into rows by y‐coordinate
+        boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
+        rows, cur_row, prev_y = [], [], None
+        for (x,y,w,h) in boxes:
+            if prev_y is None or abs(y - prev_y) < h/2:
+                cur_row.append((x,y,w,h))
+                prev_y = y if prev_y is None else prev_y
+            else:
+                rows.append(cur_row)
+                cur_row = [(x,y,w,h)]
+                prev_y  = y
+        if cur_row:
+            rows.append(cur_row)
+
+        # 4) for each cell, match every digit‐template
+        board = []
+        for row in rows:
+            row = sorted(row, key=lambda b: b[0])
+            vals = []
+            for (x,y,w,h) in row:
+                cell = win[y:y+h, x:x+w]
+                gray = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
+
+                best_digit, best_score = None, 0.0
+                for digit, tpl in self.digit_templates.items():
+                    # tpl is grayscale template, gray is your cell crop
+                    th, tw = tpl.shape[:2]
+                    ch, cw = gray.shape[:2]
+
+                    # compute scale so template fits inside the cell
+                    scale = min(cw / tw, ch / th, 1.0)
+                    if scale < 1.0:
+                        new_w = max(1, int(tw * scale))
+                        new_h = max(1, int(th * scale))
+                        tpl_rs = cv2.resize(tpl, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    else:
+                        tpl_rs = tpl
+
+                    # now safe to match
+                    res = cv2.matchTemplate(gray, tpl_rs, cv2.TM_CCOEFF_NORMED)
+                    _, maxval, _, _ = cv2.minMaxLoc(res)
+                    # print(f"Digit {digit} match score: {maxval:.2f}")
+                    if maxval > best_score:
+                        best_score = maxval
+                        best_digit = digit
+                # print(f"Cell: {x},{y} ({w},{h})")
+                # print(f"Best match: {best_digit} ({best_score:.2f})")
+                
+                if best_score >= self.DIGIT_MATCH_THRESH:
+                    vals.append(best_digit)
+                else:
+                    vals.append(None)  # no confident match
+
+            board.append(vals)
+
+        self.board = board
+
+def start_game(board: Board):
+    """Click Play, wait a bit to let the grid load."""
     
-    if des_roi is None or des_dig is None:
-        return 0
+    screen = capture_screen()
+    cv2.imwrite("screen_before_reset.png", screen)
+    board.set_reset_buttons_from_screen(screen)
+    board.reset()
+    time.sleep(1)
     
-    bf = cv2.BFMatcher(cv2.NORM_L2)
-    # KNN matching: For each descriptor in 'digit', find k=2 best matches in 'roi'
-    matches = bf.knnMatch(des_dig, des_roi, k=2)
-
-    good = []
-    for m, n in matches:
-        # "Lowe's ratio test" - only accept match if it's distinctly better than the next-best
-        if m.distance < ratio_threshold * n.distance:
-            good.append(m)
-    
-    # good matches = how many local features line up well
-    return len(good)
-
-def match_number(roi, templates, min_good_matches=8, ratio_threshold=0.75):
-    best_match_score = 0
-    best_number = -1
-    
-    for i, template in templates.items():
-        if template is None:
-            continue
-        
-        score = sift_score_digit(roi, template, ratio_threshold)
-        
-        if score > best_match_score:
-            best_match_score = score
-            best_number = i
-    
-    return best_number if best_match_score >= min_good_matches else -1
-
-def extract_numbers(screen, img_dir="img"):
-    gray_screen = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY)
-    
-    debug_img = screen.copy() if config['debug'] else None
-    
-    number_templates = {
-        i: cv2.imread(f"{img_dir}/{i}.png", cv2.IMREAD_GRAYSCALE)
-        for i in range(1, 10)
-    }
-
-    # save templates for debugging
-    if debug_img is not None:
-        cv2.imwrite("debug/debug_screen_gray.png", gray_screen)
-        for i, template in number_templates.items():
-            cv2.imwrite(f"debug/debug_template_{i}.png", template)
-    
-    
-    contours, _ = cv2.findContours(gray_screen, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    numbers_found = []
-    
-    for contour in contours:
-        x, y, w, h = cv2.boundingRect(contour)
-        roi = gray_screen[y:y+h, x:x+w]
-        number = match_number(
-            roi, 
-            number_templates,
-            min_good_matches=config['min_matches'],
-        )
-        
-        if debug_img is not None:
-            cv2.rectangle(debug_img, (x, y), (x+w, y+h), (255, 0, 0), 2)
-            cv2.putText(debug_img, str(number), (x, y), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-        
-        if number > 0:
-            numbers_found.append((number, (x, y, w, h)))
-            
-            if debug_img is not None:
-                cv2.rectangle(debug_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                cv2.putText(debug_img, str(number), (x, y), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-    if debug_img is not None:
-        print(numbers_found)
-        print(len(numbers_found))
-        cv2.imwrite("debug/debug_extract_numbers.png", debug_img)
-        
-        
-    if len(numbers_found) < config['NROWS'] * config['NCOLS']:
-        print(f"Could not find all {config['NROWS']}x{config['NCOLS']} numbers.")
-        return None
-    return numbers_found
-
-def get_board(screen, img_dir="img"):
-    numbers = extract_numbers(screen, img_dir)
-    print(numbers)
-    
-    board = [[Cell() for _ in range(config['NCOLS'])] for __ in range(config['NROWS'])]
-
-def sift_find_center(screen_gray, template_gray, min_matches=8):
-    """
-    Returns the (center_x, center_y) of the template in the screen using SIFT,
-    or None if insufficient matches or homography fails.
-    """
-
-    # 1) Create SIFT detector
-    sift = cv2.SIFT_create()
-
-    # 2) Find keypoints & descriptors
-    kp_screen, des_screen = sift.detectAndCompute(screen_gray, None)
-    kp_template, des_template = sift.detectAndCompute(template_gray, None)
-
-    if des_screen is None or des_template is None:
-        print("No descriptors found in screen or template.")
-        return None
-
-    # 3) Match descriptors with a Brute Force Matcher (crossCheck = True to filter matches)
-    bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
-    matches = bf.match(des_template, des_screen)  # query=template, train=screen
-    matches = sorted(matches, key=lambda x: x.distance)  # sort by best (lowest distance) first
-
-    # Filter out if not enough matches
-    if len(matches) < min_matches:
-        print(f"Not enough SIFT matches found: {len(matches)} / {min_matches}")
-        return None
-
-    # 4) Extract matched keypoints’ locations
-    src_pts = np.float32([kp_template[m.queryIdx].pt for m in matches]).reshape(-1,1,2)
-    dst_pts = np.float32([kp_screen[m.trainIdx].pt for m in matches]).reshape(-1,1,2)
-
-    # 5) Compute homography with RANSAC
-    M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-    if M is None:
-        print("Homography could not be computed.")
-        return None
-
-    # 6) Use homography to transform the template’s corners
-    h, w = template_gray.shape
-    corners = np.float32([[0,0],[w,0],[w,h],[0,h]]).reshape(-1,1,2)
-    transformed_corners = cv2.perspectiveTransform(corners, M)
-
-    # 7) Calculate center from transformed corners
-    #    For instance, just take the average corner:
-    center_x = int(np.mean(transformed_corners[:,0,0]))
-    center_y = int(np.mean(transformed_corners[:,0,1]))
-
-    return (center_x, center_y)
-
-def get_play_reset_buttons(screen, img_dir="img"):
-    """
-    Locate 'play' and 'reset' buttons in the screenshot using SIFT feature matching.
-    Returns (play_center, reset_center), each either (x,y) or None.
-    """
-    gray_screen = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY)
-    
-    # If debug, copy the original BGR for drawing circles
-    debug_img = screen.copy() if config['debug'] else None
-
-    positions = {}
-    for img_name in ["play", "reset"]:
-        template_gray = cv2.imread(f"{img_dir}/{img_name}.png", cv2.IMREAD_GRAYSCALE)
-        if template_gray is None:
-            print(f"Could not read template {img_name}.png from {img_dir}/")
-            positions[img_name] = None
-            continue
-
-        center = sift_find_center(
-            gray_screen,
-            template_gray,
-            min_matches=config['min_matches']
-        )
-        
-        if center is None:
-            positions[img_name] = None
-            print(f"SIFT could not locate {img_name}.")
-        else:
-            positions[img_name] = center
-            
-            # draw debug circle
-            if debug_img is not None:
-                print(f"SIFT found {img_name} at {center}.")
-                cv2.circle(debug_img, center, 10, (0, 255, 0), 2)
-                cv2.putText(debug_img, img_name, (center[0] + 10, center[1]), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-
-    # Save debug image so you can see if detection is correct
-    if debug_img is not None:
-        cv2.imwrite("debug/debug_sift_buttons.png", debug_img)
-        
-        print("Play button center:", positions["play"])
-        print("Reset button center:", positions["reset"])
-    return positions["play"], positions["reset"]
-
-def start_game(play_pos, reset_pos):
-    mouse = Controller()
-    mouse.position = reset_pos
-    time.sleep(0.1)
-    mouse.click(Button.left)
-    time.sleep(0.1)
-    mouse.position = play_pos
-    mouse.click(Button.left)
-    time.sleep(0.5)
-
-def execute_solution(solution):
-    pass
+    screen = capture_screen()
+    cv2.imwrite("screen_after_reset.png", screen)
+    board.set_play_buttons_from_screen(screen)
+    board.play()
+    time.sleep(1)
 
 def main():
-    time.sleep(2)
-    screen_bgr = capture_screen()
-
-    cv2.imwrite("debug/screen.png", screen_bgr)
-
+    time.sleep(2)                       # give you time to switch to the game
+    
     board = Board()
-    board.set_buttons_from_screen(screen_bgr)
+    start_game(board)
     
-    start_game(board.play, board.reset)
-    
-    screen_bgr = capture_screen()
-    board.set_board_from_screen(screen_bgr)
-    
-    solver = config['solver']()
-    solution = solver.solve(board.board)
-    execute_solution(solution)
-    
-    
+    mouse = Controller()
+    mouse.position = (0, 0)
+
+    # now grab the grid
+    screen2 = capture_screen()
+    cv2.imwrite("screen_grid.png", screen2)
+    board.set_board_from_screen(screen2)
+
+    print("Detected board:")
+    for row in board.board:
+        print(row)
+    # → you can now feed board.board into your solver()
 
 if __name__ == "__main__":
     main()
